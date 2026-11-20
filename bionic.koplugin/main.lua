@@ -38,6 +38,7 @@ local T = ffiUtil.template
 local Bionify = require("bionify")
 local Export = require("bionic_export")
 local Update = require("bionic_update")
+local Sync = require("bionic_sync")
 
 -- where this plugin lives (needed by the in-app uninstaller); nil if it cannot be determined
 local PLUGIN_DIR = (debug.getinfo(1, "S").source or ""):match("^@(.*)/[^/]+$")
@@ -749,6 +750,15 @@ end
 
 -- remember where we were, and in which rendering (original / bionic with these settings)
 function Bionic:onCloseDocument()
+    -- changes that were not carried over yet: do it now, the book is about to close
+    if self._live_task then UIManager:unschedule(self._live_task) end
+    if self._sync_dirty then
+        self._sync_dirty = false
+        self._in_sync = true
+        local oks, errs = pcall(self.syncBook, self, "live")
+        self._in_sync = false
+        if not oks then logger.warn("bionic: sync on close failed:", errs) end
+    end
     local file = self:currentFile()
     if not file or not self.ui.rolling or self:isMoonChapter(file) then return end
     local ok, pct = pcall(function() return self.ui.rolling:getLastPercent() end)
@@ -776,6 +786,8 @@ function Bionic:onReaderReady()
             if self.ui.rolling then self.ui.rolling:onGotoPercent(rec.pct * 100) end
         end)
     end
+    -- highlights and notes made in the other version of the book come in now
+    self.ui:registerPostReaderReadyCallback(function() self:syncOnOpen() end)
 end
 
 --------------------------------------------------------------------------
@@ -838,6 +850,9 @@ function Bionic:syncAnnotations(doc_settings, document)
         sigs[file] = target
         self.settings:saveSetting("annot_sig", sigs)
         self.settings:flush()
+        -- the sync checks later which rendering these highlights really belong to
+        self._first_sight = self._first_sight or {}
+        self._first_sight[file] = true
         return 0
     end
     if current == target then return 0 end
@@ -868,6 +883,9 @@ end
 -- KOReader sends this to every module right after it opened the book's sidecar and BEFORE any
 -- module (ReaderAnnotation included) reads it.
 function Bionic:onDocSettingsLoad(doc_settings, document)
+    -- once a day, BEFORE anything is moved or synced
+    local okb, errb = pcall(self.maybeAutoBackup, self)
+    if not okb then logger.warn("bionic: automatic backup failed:", errb) end
     local ok, moved = pcall(self.syncAnnotations, self, doc_settings, document)
     if not ok then
         logger.warn("bionic: annotation sync failed:", moved)
@@ -1572,7 +1590,8 @@ function Bionic:backupReadBook(file)
     end
     -- the book that is open: what is on screen is newer than its sidecar on disk
     local doc = self.ui and self.ui.document
-    if doc and doc.file == file and self.ui.annotation and type(self.ui.annotation.annotations) == "table" then
+    if not self._backup_sidecar_only and doc and doc.file == file and self.ui.annotation
+        and type(self.ui.annotation.annotations) == "table" then
         data.annotations = self.ui.annotation.annotations
     end
     local n = countAnnotations(data)
@@ -1588,7 +1607,10 @@ local function indentLines(s)
 end
 
 -- Returns notes, books, name, dir  |  0 (nothing to back up)  |  nil, error
-function Bionic:createBackup(name)
+-- Only the newest BACKUP_KEEP backups are kept (manual and automatic ones together).
+local BACKUP_KEEP = 3
+
+function Bionic:createBackup(name, opts)
     local now = os.time()
     name = trim(name)
     if name == "" then name = os.date("%Y-%m-%d %H:%M", now) end
@@ -1666,9 +1688,11 @@ function Bionic:createBackup(name)
     info:saveSetting("created", now)
     info:saveSetting("books", nbooks)
     info:saveSetting("notes", nnotes)
+    if opts and opts.auto then info:saveSetting("auto", true) end
     info:flush()
     if not fileHasContent(dir .. "/info.lua") then return fail(dir .. "/info.lua") end
 
+    pcall(self.pruneBackups, self, BACKUP_KEEP, dir) -- older ones beyond the newest 3 go
     return nnotes, nbooks, name, dir
 end
 
@@ -1688,6 +1712,7 @@ function Bionic:listBackups()
                     created = s:readSetting("created") or 0,
                     books = s:readSetting("books") or 0,
                     notes = s:readSetting("notes") or 0,
+                    auto = s:readSetting("auto") == true,
                 }
             end
         end
@@ -1784,6 +1809,7 @@ function Bionic:backupNowDialog(touchmenu_instance)
     local dlg
     dlg = InputDialog:new{
         title = _("Name this backup"),
+        description = _("Only the latest 3 backups are kept."),
         input = "",
         input_hint = T(_("Backup name (empty = %1)"), default_name),
         buttons = { {
@@ -1981,6 +2007,8 @@ function Bionic:restoreBackup(b)
                 plugin_changed = true
             end
             if book_added > 0 then
+                -- restored items must be treated as new by the next sync, never as "deleted there"
+                self:forgetSyncState(file)
                 added = added + book_added
                 changed = changed + 1
                 writes[#writes + 1] = { ds = ds, live = sidecar_changed and live or nil, legacy = legacy }
@@ -2123,6 +2151,686 @@ function Bionic:backupItems()
     }
 end
 
+--------------------------------------------------------------------------
+-- Highlights / notes sync between the original and the bionic copy
+--
+-- The original text is the hub. Every highlight, note and bookmark made in a bionic rendering is
+-- carried over to the original's set and the other way round (see bionic_sync.lua for how a
+-- position is translated and checked). Plugin settings hold, per book:
+--   annot_store[file][sig]   the parked sets (existing)
+--   annot_sync[file][sig]    snapshot of what was identical at the last sync, per bionic version,
+--                            so that a deletion can be told from a new item
+--   annot_pending[file]      items that could not be carried over (kept, importable by hand)
+--   annot_skip[file][id]     items the user chose not to sync
+-- Items are identified by their creation time, which KOReader itself uses as the key.
+--------------------------------------------------------------------------
+
+function Bionic:syncEnabled() return self.settings:nilOrTrue("sync_enabled") end
+function Bionic:autoBackupEnabled() return self.settings:nilOrTrue("auto_backup") end
+
+local function notify(text)
+    local ok, Notification = pcall(require, "ui/widget/notification")
+    if ok and Notification and Notification.notify then
+        Notification:notify(text)
+    else
+        UIManager:show(InfoMessage:new{ text = text, timeout = 3 })
+    end
+end
+
+-- tell the user about failures once per item and session, not after every edit
+function Bionic:notifyFailures(res)
+    if not (res and res.failed and #res.failed > 0) then return end
+    self._told = self._told or {}
+    local fresh = 0
+    for _i, f in ipairs(res.failed) do
+        local key = tostring(self:currentFile()) .. "|" .. tostring(f.id)
+        if not self._told[key] then self._told[key] = true; fresh = fresh + 1 end
+    end
+    if fresh > 0 then
+        notify(T(_("%1 highlights/notes could not be carried over. See Bionic reading > Highlight sync."), fresh))
+    end
+end
+
+function Bionic:forgetSyncState(file)
+    local syncs = self.settings:readSetting("annot_sync", {})
+    local pend = self.settings:readSetting("annot_pending", {})
+    syncs[file], pend[file] = nil, nil
+    self.settings:saveSetting("annot_sync", syncs)
+    self.settings:saveSetting("annot_pending", pend)
+end
+
+function Bionic:pruneBackups(keep, except_dir)
+    for i, b in ipairs(self:listBackups()) do
+        if i > keep and (self:backupRoot() .. "/" .. b.id) ~= except_dir then self:deleteBackup(b) end
+    end
+end
+
+-- Once a day, when the first book is opened: a backup of every book's annotations, made before
+-- anything is moved or synced.
+function Bionic:maybeAutoBackup()
+    if not self:autoBackupEnabled() then return end
+    local today = os.date("%Y-%m-%d")
+    if self.settings:readSetting("last_auto_backup") == today then return end
+    if os.time() < (self.settings:readSetting("auto_backup_retry") or 0) then return end
+    -- a crash or a failure must not be retried (and slow the opening) for every book
+    self.settings:saveSetting("auto_backup_retry", os.time() + 3600)
+    self.settings:flush()
+    self._backup_sidecar_only = true -- the open book's list is not loaded yet; its sidecar is current
+    local ok, notes, why = pcall(self.createBackup, self, T(_("Automatic backup %1"), today), { auto = true })
+    self._backup_sidecar_only = nil
+    if not ok then
+        logger.warn("bionic: automatic backup crashed:", notes)
+    elseif notes == nil then
+        logger.warn("bionic: automatic backup failed:", why)
+    elseif notes == 0 then
+        -- nothing to back up yet: look again later today, there may be highlights by then
+        self.settings:saveSetting("auto_backup_retry", os.time() + 3 * 3600)
+        self.settings:flush()
+    else
+        self.settings:saveSetting("last_auto_backup", today)
+        self.settings:flush()
+    end
+end
+
+--------------------------------------------------------------------------
+-- The context of one sync: the open book, its partner rendering and both parsed books
+--------------------------------------------------------------------------
+
+-- The position model knows normalized XPointers only; a book kept on an old crengine DOM version
+-- is left alone.
+function Bionic:domSupported()
+    local ds, doc = self.ui.doc_settings, self.ui.document
+    if not (ds and doc) then return false end
+    local v = ds:readSetting("cre_dom_version")
+    if v == nil or not doc.getDomVersionWithNormalizedXPointers then return true end
+    local ok, need = pcall(doc.getDomVersionWithNormalizedXPointers, doc)
+    return not ok or v >= need
+end
+
+-- signature of the other rendering and the path of the bionic copy (nil: there is none yet)
+function Bionic:syncPartner(file)
+    local doc = self.ui.document
+    if self:isActive() then return "orig", doc._bionic_file end
+    local cache = self:cachePathFor(file)
+    if cache and lfs.attributes(cache, "mode") == "file" then return self:structureSig(file), cache end
+    return nil
+end
+
+function Bionic:openPair(file, bionic_path)
+    local ob, e1 = Sync.open_book(file)
+    if not ob then return nil, nil, e1 end
+    local bb, e2 = Sync.open_book(bionic_path)
+    if not bb then ob:close(); return nil, nil, e2 end
+    if ob.nfrag ~= bb.nfrag then
+        ob:close(); bb:close()
+        return nil, nil, "the converted copy has a different structure"
+    end
+    return ob, bb
+end
+
+-- allow_alone: also work without a bionic copy (only the open rendering's own set is usable then)
+function Bionic:syncContext(allow_alone)
+    local file = self:currentFile()
+    if not file or Bionic.uninstalled or not self.ui.rolling or not self:isEpub(file) or self:isCacheFile(file) then
+        return nil, "unsupported"
+    end
+    local annot = self.ui.annotation
+    if not (annot and type(annot.annotations) == "table") then return nil, "no annotations" end
+    if not self:domSupported() then return nil, "old DOM version" end
+    local doc = self.ui.document
+    local active = self:isActive()
+    local partner_sig, bionic_path = self:syncPartner(file)
+    local ctx = { file = file, annot = annot, doc = doc, active = active, live = annot.annotations }
+    ctx.my_sig = active and self:annotationSig(doc) or "orig"
+    ctx.store = self.settings:readSetting("annot_store", {})
+    ctx.sets = ctx.store[file] or {}
+    if partner_sig and bionic_path then
+        local ob, bb, err = self:openPair(file, bionic_path)
+        if not ob then return nil, err end
+        ctx.partner_sig = partner_sig
+        ctx.lbook, ctx.obook = active and bb or ob, active and ob or bb
+        ctx.spoke = active and ctx.my_sig or partner_sig
+        ctx.other = ctx.sets[partner_sig] or {}
+        ctx.close = function() ob:close(); bb:close() end
+        return ctx
+    end
+    if not allow_alone or active then return nil, "no bionic copy" end
+    local ob, err = Sync.open_book(file)
+    if not ob then return nil, err end
+    ctx.lbook = ob
+    ctx.other = {}
+    ctx.close = function() ob:close() end
+    return ctx
+end
+
+function Bionic:saveOther(ctx)
+    ctx.sets[ctx.partner_sig] = #ctx.other > 0 and ctx.other or nil
+    ctx.store[ctx.file] = next(ctx.sets) ~= nil and ctx.sets or nil
+    self.settings:saveSetting("annot_store", ctx.store)
+end
+
+-- an item carried into the open book must be valid there and hold the text it is supposed to hold
+function Bionic:validLiveItem(doc, c)
+    local p0 = c.pos0 or c.page
+    if type(p0) ~= "string" or not doc:isXPointerInDocument(p0) then return false, "position is not valid in this book" end
+    if c.pos1 then
+        if not doc:isXPointerInDocument(c.pos1) then return false, "position is not valid in this book" end
+        if type(c.text) == "string" and c.text ~= "" and not c.text_edited then
+            local t = doc:getTextFromXPointers(c.pos0, c.pos1)
+            if type(t) == "string" and Sync.norm(t) ~= Sync.norm(c.text) then
+                return false, "the text differs in this version"
+            end
+        end
+    end
+    return true
+end
+
+local function snippet(it)
+    local t = tostring(it.text or it.note or ""):gsub("%s+", " ")
+    local out, n = {}, 0
+    for ch in t:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        n = n + 1
+        if n > 24 then out[#out + 1] = "…"; break end
+        out[#out + 1] = ch
+    end
+    return table.concat(out)
+end
+
+-- first time this book is seen with the plugin: were the sidecar's highlights made in this
+-- rendering? If they only fit the other one, they belong to the other set.
+function Bionic:fixOrigin(ctx)
+    if not ctx.obook then return end
+    local own_ok, own_n = Sync.verify_items(ctx.live, ctx.lbook)
+    if own_n == 0 or own_ok * 2 >= own_n then return end
+    local oth_ok, oth_n = Sync.verify_items(ctx.live, ctx.obook)
+    if oth_n > 0 and oth_ok * 2 >= oth_n then
+        logger.info("bionic: the highlights in the sidecar belong to the other rendering, moving them")
+        for i = 1, #ctx.live do table.insert(ctx.other, ctx.live[i]) end
+        for i = #ctx.live, 1, -1 do table.remove(ctx.live, i) end
+    end
+end
+
+function Bionic:updatePending(ctx, res, mode)
+    local pend = self.settings:readSetting("annot_pending", {})
+    local live_name = ctx.active and "bionic" or "orig"
+    local other_name = ctx.active and "orig" or "bionic"
+    local kept = {}
+    for _i, e in ipairs(pend[ctx.file] or {}) do
+        local replaced = e.spoke == ctx.spoke and (mode ~= "live" or e.from == live_name)
+        if not replaced then kept[#kept + 1] = e end
+    end
+    for _i, f in ipairs(res.failed) do
+        kept[#kept + 1] = {
+            spoke = ctx.spoke, id = f.id, from = f.side == "a" and live_name or other_name,
+            item = Sync.copy(f.item), reason = tostring(f.reason),
+        }
+    end
+    pend[ctx.file] = #kept > 0 and kept or nil
+    self.settings:saveSetting("annot_pending", pend)
+end
+
+function Bionic:pendingFor(file)
+    return self.settings:readSetting("annot_pending", {})[file] or {}
+end
+
+function Bionic:pendingCount()
+    local file = self:currentFile()
+    return file and #self:pendingFor(file) or 0
+end
+
+-- mode "open": both ways, changes the open book's list;  mode "live": the open book's changes
+-- go to the other rendering only.
+function Bionic:syncWithContext(ctx, mode)
+    local file, live = ctx.file, ctx.live
+    if not ctx.obook then return nil, "no bionic copy" end
+    local syncs = self.settings:readSetting("annot_sync", {})
+    local per_file = syncs[file] or {}
+    local base = per_file[ctx.spoke]
+    local skip = self.settings:readSetting("annot_skip", {})[file]
+
+    if base == nil and mode == "open" and self._first_sight and self._first_sight[file] and #live > 0 then
+        self:fixOrigin(ctx)
+    end
+    local other = ctx.other
+    if base ~= nil and #live == 0 and #other == 0 then return { failed = {}, added_a = 0, added_b = 0 } end
+
+    local notice
+    if base == nil and #live + #other > 15 then
+        notice = InfoMessage:new{ text = _("Syncing highlights and notes…") }
+        UIManager:show(notice)
+        UIManager:forceRePaint()
+    end
+
+    local doc = ctx.doc
+    local res = Sync.reconcile(live, other, {
+        base = base, skip = skip, one_way = mode == "live" and "a" or nil,
+        a_to_b = function(it) return Sync.convert_item(it, ctx.lbook, ctx.obook) end,
+        b_to_a = function(it)
+            local c, why = Sync.convert_item(it, ctx.obook, ctx.lbook)
+            if not c then return nil, why end
+            local okv, reason = self:validLiveItem(doc, c)
+            if not okv then return nil, reason end
+            return c
+        end,
+    })
+    if notice then UIManager:close(notice) end
+
+    local live_changed = res.added_a + res.updated_a + res.deleted_a > 0
+    local other_changed = res.added_b + res.updated_b + res.deleted_b > 0
+    if other_changed or (ctx.sets[ctx.partner_sig] == nil and #other > 0) then
+        Sync.sort_items(other, ctx.obook)
+        self:saveOther(ctx)
+    end
+    per_file[ctx.spoke] = res.base
+    syncs[file] = per_file
+    self.settings:saveSetting("annot_sync", syncs)
+    self:updatePending(ctx, res, mode)
+    self.settings:flush()
+
+    if live_changed and mode == "open" then
+        ctx.annot:updateAnnotations(true, true) -- KOReader sorts them and fills in the page numbers
+        pcall(function() self.ui.view:resetHighlightBoxesCache() end)
+        UIManager:setDirty(self.ui.dialog, "ui")
+    end
+    return res
+end
+
+function Bionic:syncBook(mode)
+    if not self:syncEnabled() then return nil, "off" end
+    local ctx, why = self:syncContext()
+    if not ctx then return nil, why end
+    local ok, res, err = pcall(self.syncWithContext, self, ctx, mode)
+    ctx.close()
+    if not ok then
+        logger.warn("bionic: sync failed:", res)
+        return nil, tostring(res)
+    end
+    return res, err
+end
+
+-- the book has just been opened
+function Bionic:syncOnOpen()
+    self._in_sync = true
+    local ok, res, why = pcall(self.syncBook, self, "open")
+    self._in_sync = false
+    if self._first_sight and self.ui.document then self._first_sight[self.ui.document.file] = nil end
+    if not ok then
+        logger.warn("bionic: sync on open crashed:", res)
+        return
+    end
+    if not res then
+        if why ~= "off" and why ~= "no bionic copy" and why ~= "unsupported" then
+            logger.info("bionic: sync skipped:", why)
+        end
+        return
+    end
+    local got = (res.added_a or 0) + (res.updated_a or 0)
+    if got > 0 then
+        notify(T(_("Brought in %1 highlights/notes from the other version of this book."), got))
+    end
+    self:notifyFailures(res)
+end
+
+-- KOReader tells everyone whenever a highlight, note or bookmark is added, changed or removed.
+-- Never returns true: other modules need this event too.
+function Bionic:onAnnotationsModified(_items)
+    if self._in_sync or not self:syncEnabled() then return end
+    local file = self:currentFile()
+    if not file or not self.ui.rolling or not self:isEpub(file) or self:isCacheFile(file) then return end
+    self._sync_dirty = true
+    if not self._live_task then
+        self._live_task = function() self:runLiveSync() end
+    end
+    UIManager:unschedule(self._live_task)
+    UIManager:scheduleIn(3, self._live_task)
+end
+
+function Bionic:runLiveSync()
+    if not self._sync_dirty or self._in_sync then return end
+    self._sync_dirty = false
+    self._in_sync = true
+    local ok, res, why = pcall(self.syncBook, self, "live")
+    self._in_sync = false
+    if not ok then
+        logger.warn("bionic: live sync crashed:", res)
+    elseif res and res.failed and #res.failed > 0 then
+        self:notifyFailures(res)
+    elseif not res and why and why ~= "off" and why ~= "no bionic copy" and why ~= "unsupported" then
+        logger.info("bionic: live sync skipped:", why)
+    end
+end
+
+-- manual: carry the open book's changes over, then reopen it so that the other version's items
+-- come in with the full two-way sync
+function Bionic:syncNow()
+    if not self:syncEnabled() then return end
+    self._in_sync = true
+    pcall(self.syncBook, self, "live")
+    self._in_sync = false
+    self._sync_dirty = false
+    self.ui:reloadDocument(nil, false)
+end
+
+--------------------------------------------------------------------------
+-- Items that could not be carried over: import by hand
+--------------------------------------------------------------------------
+
+-- entries: a subset of the open book's pending list. Returns imported, left
+function Bionic:importPending(entries)
+    local ctx, why = self:syncContext()
+    if not ctx then return nil, why end
+    local ok, imported, left = pcall(function()
+        local syncs = self.settings:readSetting("annot_sync", {})
+        local per_file = syncs[ctx.file] or {}
+        local base = per_file[ctx.spoke] or {}
+        local live_name = ctx.active and "bionic" or "orig"
+        local done, n_other, n_live = {}, 0, 0
+        local ids = Sync.ids(ctx.live)
+        local have = {}
+        for _i, id in ipairs(ids) do have[id] = true end
+        for _i, e in ipairs(entries) do
+            if e.spoke == ctx.spoke then
+                if e.from == live_name then
+                    local c = Sync.convert_item(e.item, ctx.lbook, ctx.obook, true)
+                    if c then
+                        table.insert(ctx.other, c)
+                        base[e.id] = Sync.fingerprint(c)
+                        done[e] = true; n_other = n_other + 1
+                    end
+                else
+                    local c = Sync.convert_item(e.item, ctx.obook, ctx.lbook, true)
+                    if c and self:validLiveItem(ctx.doc, c) and not have[e.id] then
+                        ctx.annot:addItem(c)
+                        base[e.id] = Sync.fingerprint(c)
+                        done[e] = true; n_live = n_live + 1
+                    end
+                end
+            end
+        end
+        if n_other > 0 then
+            Sync.sort_items(ctx.other, ctx.obook)
+            self:saveOther(ctx)
+        end
+        per_file[ctx.spoke] = base
+        syncs[ctx.file] = per_file
+        self.settings:saveSetting("annot_sync", syncs)
+        local pend = self.settings:readSetting("annot_pending", {})
+        local kept = {}
+        for _i, e in ipairs(pend[ctx.file] or {}) do
+            local gone = false
+            for d in pairs(done) do if d == e or (d.id == e.id and d.spoke == e.spoke) then gone = true end end
+            if not gone then kept[#kept + 1] = e end
+        end
+        pend[ctx.file] = #kept > 0 and kept or nil
+        self.settings:saveSetting("annot_pending", pend)
+        self.settings:flush()
+        if n_live > 0 then
+            pcall(function() self.ui.view:resetHighlightBoxesCache() end)
+            UIManager:setDirty(self.ui.dialog, "ui")
+        end
+        return n_other + n_live, #kept
+    end)
+    ctx.close()
+    if not ok then
+        logger.warn("bionic: import of pending items failed:", imported)
+        return nil, tostring(imported)
+    end
+    return imported, left
+end
+
+function Bionic:discardPending(entries)
+    local file = self:currentFile()
+    if not file then return end
+    local pend = self.settings:readSetting("annot_pending", {})
+    local skip = self.settings:readSetting("annot_skip", {})
+    skip[file] = skip[file] or {}
+    local kept = {}
+    for _i, e in ipairs(pend[file] or {}) do
+        local drop = false
+        for _j, d in ipairs(entries) do if d == e then drop = true end end
+        if drop then skip[file][e.id] = true else kept[#kept + 1] = e end
+    end
+    pend[file] = #kept > 0 and kept or nil
+    self.settings:saveSetting("annot_pending", pend)
+    self.settings:saveSetting("annot_skip", skip)
+    self.settings:flush()
+end
+
+function Bionic:reportImport(imported, left)
+    local text
+    if imported == nil then
+        text = T(_("Import failed: %1"), tostring(left))
+    elseif imported == 0 then
+        text = _("Nothing could be imported. The text was not found in the other version.")
+    else
+        text = T(_("Imported %1 highlights/notes."), imported)
+        if left and left > 0 then text = text .. "\n" .. T(_("%1 are still pending."), left) end
+    end
+    UIManager:show(InfoMessage:new{ text = text })
+end
+
+function Bionic:pendingItems()
+    local file = self:currentFile()
+    local list = file and self:pendingFor(file) or {}
+    local items = {}
+    for _i, e in ipairs(list) do
+        items[#items + 1] = {
+            text_func = function() return snippet(e.item) end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                local ButtonDialog = require("ui/widget/buttondialog")
+                local dlg
+                dlg = ButtonDialog:new{
+                    title = snippet(e.item) .. "\n" .. T(_("Reason: %1"), _(e.reason or "?")),
+                    buttons = {
+                        { { text = _("Import by searching for the text"), callback = function()
+                            UIManager:close(dlg)
+                            local n, left = self:importPending({ e })
+                            if touchmenu_instance then touchmenu_instance:closeMenu() end
+                            self:reportImport(n, left)
+                        end } },
+                        { { text = _("Discard (do not sync this one)"), callback = function()
+                            UIManager:close(dlg)
+                            self:discardPending({ e })
+                            if touchmenu_instance then touchmenu_instance:closeMenu() end
+                        end } },
+                        { { text = _("Cancel"), callback = function() UIManager:close(dlg) end } },
+                    },
+                }
+                UIManager:show(dlg)
+            end,
+        }
+    end
+    if #items > 0 then
+        items[#items].separator = true
+        items[#items + 1] = {
+            text_func = function() return _("Import all by searching for the text") end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                local n, left = self:importPending(self:pendingFor(file))
+                if touchmenu_instance then touchmenu_instance:closeMenu() end
+                self:reportImport(n, left)
+            end,
+        }
+    else
+        items[1] = { text_func = function() return _("Nothing pending") end, enabled_func = function() return false end }
+    end
+    return items
+end
+
+--------------------------------------------------------------------------
+-- Import the open book's highlights and notes from a backup, whenever you like
+--
+-- Adds what the book does not have. A set made in the other version of the book (original <->
+-- bionic) is translated first; sets of other bionic settings cannot be and are skipped.
+--------------------------------------------------------------------------
+
+function Bionic:importBookFromBackup(b)
+    if not (b and type(b.id) == "string" and b.id:match("^[%w_]+$")) then return nil, "bad backup" end
+    local path = self:backupRoot() .. "/" .. b.id .. "/backup.lua"
+    if not fileHasContent(path) then return nil, path end
+    local ctx, why = self:syncContext(true)
+    if not ctx then return nil, why end
+    local ok, added, dup, skipped, found = pcall(function()
+        local data = LuaSettings:open(path)
+        local entry = (data:readSetting("books", {}))[ctx.file]
+        local plugin = data:readSetting("plugin", {})
+        local ann = type(entry) == "table" and type(entry.data) == "table" and entry.data or {}
+        local sets = {}
+        local bsig = type(plugin.annot_sig) == "table" and plugin.annot_sig[ctx.file] or nil
+        if type(ann.annotations) == "table" and #ann.annotations > 0 then
+            if bsig == nil then -- unknown: find out by looking at the text
+                local a_ok, a_n = Sync.verify_items(ann.annotations, ctx.lbook)
+                local o_ok, o_n = 0, 0
+                if ctx.obook then o_ok, o_n = Sync.verify_items(ann.annotations, ctx.obook) end
+                if a_n > 0 and a_ok * 2 >= a_n then bsig = ctx.my_sig
+                elseif o_n > 0 and o_ok * 2 >= o_n then bsig = ctx.partner_sig end
+            end
+            if bsig ~= nil then sets[#sets + 1] = { sig = bsig, list = ann.annotations } end
+        end
+        local bstore = type(plugin.annot_store) == "table" and plugin.annot_store[ctx.file] or nil
+        for sig, list in pairs(bstore or {}) do
+            if type(list) == "table" then sets[#sets + 1] = { sig = sig, list = list } end
+        end
+        local have = {}
+        for _i, id in ipairs(Sync.ids(ctx.live)) do have[id] = true end
+        local n_add, n_dup, n_skip, n_found = 0, 0, 0, 0
+        for _i, set in ipairs(sets) do
+            local convert
+            if set.sig == ctx.my_sig then
+                convert = function(it) return Sync.copy(it) end
+            elseif ctx.obook and set.sig == ctx.partner_sig then
+                convert = function(it) return Sync.convert_item(it, ctx.obook, ctx.lbook) end
+            end
+            for _j, it in ipairs(set.list) do
+                if type(it) == "table" then
+                    n_found = n_found + 1
+                    local c = convert and convert(it)
+                    if not c then
+                        n_skip = n_skip + 1
+                    elseif have[tostring(it.datetime or "")] then
+                        n_dup = n_dup + 1
+                    elseif not self:validLiveItem(ctx.doc, c) then
+                        n_skip = n_skip + 1
+                    else
+                        ctx.annot:addItem(c)
+                        have[tostring(c.datetime or "")] = true
+                        n_add = n_add + 1
+                    end
+                end
+            end
+        end
+        if n_add > 0 then
+            pcall(function() self.ui.view:resetHighlightBoxesCache() end)
+            UIManager:setDirty(self.ui.dialog, "ui")
+        end
+        return n_add, n_dup, n_skip, n_found
+    end)
+    ctx.close()
+    if not ok then
+        logger.warn("bionic: import from backup failed:", added)
+        return nil, tostring(added)
+    end
+    if added > 0 then
+        -- carry them over to the other version as well
+        self._sync_dirty = true
+        if not self._live_task then self._live_task = function() self:runLiveSync() end end
+        UIManager:unschedule(self._live_task)
+        UIManager:scheduleIn(1, self._live_task)
+    end
+    return added, dup, skipped, found
+end
+
+function Bionic:confirmImportFromBackup(b, touchmenu_instance)
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Import this book's highlights and notes from \"%1\"?\nOnly what this book does not have yet is added."), b.name),
+        ok_text = _("Import"),
+        ok_callback = function()
+            local added, dup, skipped, found = self:importBookFromBackup(b)
+            if touchmenu_instance then touchmenu_instance:closeMenu() end
+            local text
+            if added == nil then
+                text = T(_("Import failed: %1"), tostring(dup))
+            elseif (found or 0) == 0 then
+                text = _("This backup has nothing for this book.")
+            else
+                text = T(_("Imported %1 highlights/notes."), added)
+                if dup > 0 then text = text .. "\n" .. T(_("%1 were already in the book."), dup) end
+                if skipped > 0 then
+                    text = text .. "\n" .. T(_("%1 could not be placed in this version of the book."), skipped)
+                end
+            end
+            UIManager:show(InfoMessage:new{ text = text })
+        end,
+    })
+end
+
+function Bionic:importBackupItems()
+    local items = {}
+    local list = self:listBackups()
+    for _i, b in ipairs(list) do
+        items[#items + 1] = {
+            text_func = function() return T(_("%1 (%2 books, %3 notes)"), b.name, b.books, b.notes) end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance) self:confirmImportFromBackup(b, touchmenu_instance) end,
+        }
+    end
+    if #items == 0 then
+        items[1] = { text_func = function() return _("No backups yet") end, enabled_func = function() return false end }
+    end
+    return items
+end
+
+function Bionic:syncItems()
+    local function inBook() return self.ui.document ~= nil and self.ui.rolling ~= nil and self:canToggle() end
+    return {
+        {
+            text_func = function() return _("Sync highlights and notes between original and bionic") end,
+            checked_func = function() return self:syncEnabled() end,
+            callback = function()
+                self.settings:saveSetting("sync_enabled", not self:syncEnabled())
+                self.settings:flush()
+            end,
+            separator = true,
+        },
+        {
+            text_func = function() return _("Sync this book now") end,
+            enabled_func = function() return inBook() and self:syncEnabled() end,
+            callback = function(touchmenu_instance)
+                if touchmenu_instance then touchmenu_instance:closeMenu() end
+                UIManager:nextTick(function() self:syncNow() end)
+            end,
+        },
+        {
+            text_func = function() return T(_("Not carried over yet (%1)"), self:pendingCount()) end,
+            enabled_func = function() return inBook() and self:pendingCount() > 0 end,
+            keep_menu_open = true,
+            sub_item_table_func = function() return self:pendingItems() end,
+            separator = true,
+        },
+        {
+            text_func = function() return _("Back up now…") end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance) self:backupNowDialog(touchmenu_instance) end,
+        },
+        {
+            text_func = function() return _("Automatic backup once a day") end,
+            checked_func = function() return self:autoBackupEnabled() end,
+            callback = function()
+                self.settings:saveSetting("auto_backup", not self:autoBackupEnabled())
+                self.settings:flush()
+            end,
+        },
+        {
+            text_func = function() return _("Import this book's notes from a backup") end,
+            enabled_func = function() return inBook() and #self:listBackups() > 0 end,
+            keep_menu_open = true,
+            sub_item_table_func = function() return self:importBackupItems() end,
+        },
+    }
+end
+
 function Bionic:addToMainMenu(menu_items)
     menu_items.bionic_reading = {
         text_func = function() return _("Bionic reading") end,
@@ -2196,20 +2904,15 @@ function Bionic:addToMainMenu(menu_items)
                 separator = true,
             },
             {
-                text_func = function() return _("Backup highlights and notes") end,
+                text_func = function() return _("Highlight sync") end,
+                keep_menu_open = true,
+                sub_item_table_func = function() return self:syncItems() end,
+            },
+            {
+                text_func = function() return _("Backup annotations") end,
                 keep_menu_open = true,
                 sub_item_table = self:backupItems(),
                 separator = true,
-            },
-            {
-                text_func = function() return _("Restore original online-source chapters") end,
-                enabled_func = function() return not self:isActive() or not self:isMoonChapter(self:currentFile()) end,
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    local restored = self:restoreAllChapters()
-                    UIManager:show(InfoMessage:new{ text = T(_("Restored %1 chapter files."), restored) })
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
-                end,
             },
             {
                 text_func = function()
