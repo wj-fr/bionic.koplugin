@@ -1,6 +1,6 @@
 **简体中文** | [English](README.en.md)
 
-# 纯AI的自用ADHD仿生阅读插件
+# ADHD仿生阅读插件
 
 # Kindle-KOreader-Bionic-Reading（仿生阅读插件）
 
@@ -25,8 +25,8 @@
 
 | 项目 | 说明 |
 |---|---|
-| 已验证设备 | Kindle 2024（固件 5.18，已越狱并安装 KOReader） |
-| 其他设备 | 插件里没有针对设备型号的代码，理论上能运行 KOReader 的设备都可以使用，但**未经测试** |
+| 已验证设备 | Kindle 2024|
+| 其他设备 | 理论上能运行 KOReader 的设备都可以使用，但**未经测试** |
 | 支持格式 | 仅 EPUB。PDF、MOBI、AZW3 等格式不支持，可先用 Calibre 等工具转成 EPUB |
 | 依赖 | 无需其他插件。月读为可选 |
 
