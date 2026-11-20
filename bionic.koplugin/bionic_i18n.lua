@@ -29,8 +29,8 @@ local ZH = {
     ["Bionic effect on Chinese text: %1"] = "对中文文字使用仿生效果：%1",
     ["Chunk size"] = "分组大小",
     ["off"] = "关闭",
-    ["Chinese/Japanese/Korean have no spaces, so words cannot be detected. If set to N, every N characters are treated as one 'word'. 0 = leave CJK text alone."] =
-        "中日韩文字没有空格，无法识别词语。设为 N 时，每 N 个字视为一个“词”。0 表示不处理中日韩文字。",
+    ["Chinese characters have no spaces, so words cannot be detected. If set to N, every N characters are treated as one 'word'. 0 = leave Chinese characters alone."] =
+        "中文汉字没有空格，无法识别词语。设为N时，每N个字视为一个“词”。0表示不处理中文汉字。",
     ["Uninstall Bionic Reading…"] = "卸载仿生阅读…",
     ["Uninstall"] = "卸载",
     ["Bionic Reading has been uninstalled. Restart KOReader now?"] = "仿生阅读已卸载。现在重启 KOReader 吗？",
@@ -95,7 +95,6 @@ local ZH = {
     ["%1 highlights/notes belong to a different bionic rendering of this book. They are kept and will come back when you switch back."] =
         "本书有 %1 条高亮/笔记属于另一种仿生渲染方式。它们已妥善保存，切换回去后会重新出现。",
     -- backups of highlights and notes
-    ["Backup annotations"] = "备份批注",
     ["Back up now…"] = "立即备份…",
     ["Name this backup"] = "为本次备份命名",
     ["Backup name (empty = %1)"] = "备份名称（留空则为 %1）",
@@ -174,8 +173,8 @@ local ZH = {
     ["Preparing bionic reading… this is slow only the first time this book is opened."] = "正在准备仿生阅读…只有这本书第一次打开时会比较慢。",
     -- highlight sync
     ["Only the latest 3 backups are kept."] = "只保留最近 3 份备份。",
-    ["Highlight sync"] = "批注同步",
-    ["Sync highlights and notes between original and bionic"] = "在原书与仿生版之间同步高亮和笔记",
+    ["Highlight sync/backup"] = "批注同步/备份",
+    ["Sync highlights and notes automatically"] = "自动同步批注",
     ["Sync this book now"] = "立即同步本书",
     ["Not carried over yet (%1)"] = "未能同步的批注（%1）",
     ["Automatic backup once a day"] = "每天自动备份一次",
@@ -183,7 +182,7 @@ local ZH = {
     ["Import this book's notes from a backup"] = "从备份导入本书的批注",
     ["Syncing highlights and notes…"] = "正在同步高亮和笔记…",
     ["Brought in %1 highlights/notes from the other version of this book."] = "已从本书的另一个版本带入 %1 条高亮/笔记。",
-    ["%1 highlights/notes could not be carried over. See Bionic reading > Highlight sync."] = "有 %1 条高亮/笔记未能同步。请在“仿生阅读 > 批注同步”中查看。",
+    ["%1 highlights/notes could not be carried over. See Bionic reading > Highlight sync/backup."] = "有 %1 条高亮/笔记未能同步。请在“仿生阅读 > 批注同步/备份”中查看。",
     ["Import failed: %1"] = "导入失败：%1",
     ["Nothing could be imported. The text was not found in the other version."] = "没有可导入的内容：在另一个版本中找不到这段文字。",
     ["Imported %1 highlights/notes."] = "已导入 %1 条高亮/笔记。",

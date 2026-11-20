@@ -1168,7 +1168,7 @@ function Bionic:cjkItems()
     local items = {
         self:spinItem("Bionic effect on Chinese text: %1", "cjk_chunk", 0, 6, 1, D.cjk_chunk, {
             title = "Chunk size", zero_text = "off",
-            info = "Chinese/Japanese/Korean have no spaces, so words cannot be detected. If set to N, every N characters are treated as one 'word'. 0 = leave CJK text alone." }),
+            info = "Chinese characters have no spaces, so words cannot be detected. If set to N, every N characters are treated as one 'word'. 0 = leave Chinese characters alone." }),
         self:spinItem("Emphasised share: %1%", "cjk_ratio", 20, 80, 10, D.cjk_ratio, {
             title = "Emphasised share (%)", enabled = on,
             info = "Share of each chunk that is emphasised. 50 = the first half.",
@@ -2187,7 +2187,7 @@ function Bionic:notifyFailures(res)
         if not self._told[key] then self._told[key] = true; fresh = fresh + 1 end
     end
     if fresh > 0 then
-        notify(T(_("%1 highlights/notes could not be carried over. See Bionic reading > Highlight sync."), fresh))
+        notify(T(_("%1 highlights/notes could not be carried over. See Bionic reading > Highlight sync/backup."), fresh))
     end
 end
 
@@ -2784,9 +2784,9 @@ end
 
 function Bionic:syncItems()
     local function inBook() return self.ui.document ~= nil and self.ui.rolling ~= nil and self:canToggle() end
-    return {
+    local items = {
         {
-            text_func = function() return _("Sync highlights and notes between original and bionic") end,
+            text_func = function() return _("Sync highlights and notes automatically") end,
             checked_func = function() return self:syncEnabled() end,
             callback = function()
                 self.settings:saveSetting("sync_enabled", not self:syncEnabled())
@@ -2827,8 +2827,13 @@ function Bionic:syncItems()
             enabled_func = function() return inBook() and #self:listBackups() > 0 end,
             keep_menu_open = true,
             sub_item_table_func = function() return self:importBackupItems() end,
+            separator = true,
         },
     }
+    -- restore / delete / folder (the "Back up now" entry is already above)
+    local backup = self:backupItems()
+    for i = 2, #backup do items[#items + 1] = backup[i] end
+    return items
 end
 
 function Bionic:addToMainMenu(menu_items)
@@ -2904,14 +2909,9 @@ function Bionic:addToMainMenu(menu_items)
                 separator = true,
             },
             {
-                text_func = function() return _("Highlight sync") end,
+                text_func = function() return _("Highlight sync/backup") end,
                 keep_menu_open = true,
                 sub_item_table_func = function() return self:syncItems() end,
-            },
-            {
-                text_func = function() return _("Backup annotations") end,
-                keep_menu_open = true,
-                sub_item_table = self:backupItems(),
                 separator = true,
             },
             {

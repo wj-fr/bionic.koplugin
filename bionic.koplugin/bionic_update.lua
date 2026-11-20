@@ -23,7 +23,7 @@ local T = ffiUtil.template
 
 local U = {}
 
-U.VERSION = "1.0.2"
+U.VERSION = "1.0.3"
 U.REPO = "wj-fr/Kindle-KOreader-Bionic-Reading"
 
 --------------------------------------------------------------------------
