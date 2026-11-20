@@ -79,7 +79,7 @@ Chinese has no spaces, so words cannot be identified. The plugin therefore **spl
 
 | Setting | Range | Default | Description |
 |---|---|---|---|
-| Bionic effect on Chinese text | On / Off | Off | Must be turned on manually |
+| Bionic effect on Chinese text | On / Off | Off | Chinese characters have no spaces, so words cannot be detected. When set to N, every N characters are treated as one “word”. 0 means Chinese characters are left unprocessed.|
 | Emphasised share | 20 – 80% | 50% | The proportion of each group that is emphasised. 50% means the first half |
 | Saccades interval | 0 – 4 | 0 | How many groups to skip between two emphasised groups |
 | Edge opacity | 20 – 100% | 100% | The brightness of the non-emphasised part of each group |
